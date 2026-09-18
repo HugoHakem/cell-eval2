@@ -751,7 +751,8 @@ def _side_bulks(source, *, fp, store, norms, cfg, side, effective_input_type=Non
                 # inmem_pseudobulk, so the moments arm must be handled HERE.
                 if target_with_moments:
                     perts, means, moms = pseudobulk_bulk_lognorm_with_moments(
-                        adata, cfg.pert_col, bulk_target_sum=cfg.bulk_target_sum)
+                        adata, cfg.pert_col, bulk_target_sum=cfg.bulk_target_sum,
+                        threads=cfg.num_threads)
                     return (perts, means), moms
                 return pseudobulk_bulk_lognorm(
                     adata, cfg.pert_col, bulk_target_sum=cfg.bulk_target_sum

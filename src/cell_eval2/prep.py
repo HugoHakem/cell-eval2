@@ -4,7 +4,7 @@ import anndata as ad
 import numpy as np
 from scipy.sparse import issparse
 
-from .moments import GroupMoments, jackknife_correction
+from .moments import GroupMoments, _resolve_threads, jackknife_correction
 
 
 def _group_row_index(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -361,8 +361,13 @@ def pseudobulk_bulk_lognorm(adata, pert_col: str, *, bulk_target_sum: float):
     return perts, bulk_lognorm_means(sums, bulk_target_sum)
 
 
-def pseudobulk_bulk_lognorm_with_moments(adata, pert_col: str, *, bulk_target_sum: float):
+def pseudobulk_bulk_lognorm_with_moments(adata, pert_col: str, *, bulk_target_sum: float,
+                                         threads: int = 1):
     """``(perts, means, GroupMoments)`` in the ``bulk_lognorm`` space, from a COUNTS ``adata``.
+
+    ``threads`` (vcc2026 fork, default 1 = sequential, matching every other call site's
+    existing default): forwarded to ``_grouped_sumsq`` and ``jackknife_correction``, whose
+    own docstrings cover why threading helps and is safe there.
 
     The RESIDENT reference every driver is asserted against (spec §6 test 7): cells are resident,
     so the second pass is local and there is no streaming subtlety to get wrong.
@@ -412,11 +417,34 @@ def pseudobulk_bulk_lognorm_with_moments(adata, pert_col: str, *, bulk_target_su
     return perts, bulk_lognorm_means(_grouped_sums(adata.X, order, bounds, n_groups),
                                      bulk_target_sum), GroupMoments(
         perts=perts, counts=np.diff(bounds).astype(np.float64),
-        sumsq=_grouped_sumsq(adata.X, order, bounds, n_groups),
-        jk=jackknife_correction(adata.X, codes, n_groups, bulk_target_sum))
+        sumsq=_grouped_sumsq(adata.X, order, bounds, n_groups, threads=threads),
+        # chunk left at jackknife_correction's own default (512), not hand-tuned down: a
+        # smaller chunk is faster on ONE measured machine (cache-locality), but this cluster
+        # is genuinely heterogeneous (Intel Icelake and AMD Genoa/Turin nodes in the same
+        # partition pool, confirmed via `sinfo`/`scontrol show node`), and the fork's own
+        # authors left THEIR default at 512 "pending a measurement on a second box" despite
+        # measuring the same faster-when-smaller trend on their own machine -- the same
+        # caution applies here, more so, since we don't control which node type a job lands
+        # on. `threads`, in contrast, is a portable win: it scales with core count, not cache
+        # size, and gets most of the benefit at the safe default chunk (confirmed directly:
+        # ~3.9x at chunk=512 with threading here, vs ~2x from chunk-tuning alone on one node).
+        jk=jackknife_correction(adata.X, codes, n_groups, bulk_target_sum, threads=threads))
 
 
-def _grouped_sumsq(X, order, bounds, n_groups) -> np.ndarray:
+def _grouped_sumsq_one(X, rows, sparse) -> float:
+    if rows.size == 0:
+        return 0.0
+    sub = X[rows]
+    if sparse:
+        sub = sub.tocsr()
+        sub.sum_duplicates()          # see _grouped_sumsq's docstring -- correctness, not hygiene
+        d = np.asarray(sub.data, dtype=np.float64)
+    else:
+        d = np.asarray(sub, dtype=np.float64).ravel()
+    return float(np.dot(d, d))
+
+
+def _grouped_sumsq(X, order, bounds, n_groups, *, threads: int = 1) -> np.ndarray:
     """Per-group ``Σᵢ ‖xᵢ‖²`` over the rows grouped by ``order``/``bounds``.
 
     Sums the squares of every entry of the group's rows. On sparse input this runs over
@@ -430,23 +458,28 @@ def _grouped_sumsq(X, order, bounds, n_groups) -> np.ndarray:
     ``X[rows]`` fancy-indexing already returns a fresh copy, so the in-place canonicalization
     cannot touch the caller's matrix.
 
+    ``threads`` (vcc2026 fork): each group is an independent, GIL-releasing unit of work (a
+    fancy-index + sparse canonicalize + dot product), and group sizes vary hugely (33 to
+    38,176 cells in our own panels) -- dispatching one joblib task per group rather than
+    static blocks lets its thread pool pick up the next pending group as soon as a thread
+    frees up, which load-balances that skew automatically instead of one thread getting
+    stuck with the control group while others sit idle.
+
     Returns [n_groups] float64.
     """
     sparse = issparse(X)
-    out = np.zeros(n_groups, dtype=np.float64)
-    for g in range(n_groups):
-        rows = order[bounds[g]:bounds[g + 1]]
-        if rows.size == 0:
-            continue
-        sub = X[rows]
-        if sparse:
-            sub = sub.tocsr()
-            sub.sum_duplicates()          # see the docstring -- correctness, not hygiene
-            d = np.asarray(sub.data, dtype=np.float64)
-        else:
-            d = np.asarray(sub, dtype=np.float64).ravel()
-        out[g] = float(np.dot(d, d))
-    return out
+    n_jobs = _resolve_threads(threads)
+    if n_jobs <= 1 or n_groups < 2:
+        return np.array(
+            [_grouped_sumsq_one(X, order[bounds[g]:bounds[g + 1]], sparse) for g in range(n_groups)],
+            dtype=np.float64,
+        )
+    from joblib import Parallel, delayed
+
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_grouped_sumsq_one)(X, order[bounds[g]:bounds[g + 1]], sparse) for g in range(n_groups)
+    )
+    return np.asarray(results, dtype=np.float64)
 
 
 def pseudobulk_with_moments(

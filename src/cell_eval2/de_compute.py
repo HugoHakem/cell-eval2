@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import importlib.util
 import logging
-import os
 
 import anndata as ad
 import numpy as np
@@ -13,6 +12,7 @@ from scipy.stats import false_discovery_control
 
 from .de import normalize_de_schema
 from .gpu import _release_gpu_pool
+from .moments import _resolve_threads
 from .prep import _group_row_index, _grouped_means
 
 logger = logging.getLogger(__name__)
@@ -900,14 +900,6 @@ def _de_scanpy_pvalues(log_adata, *, groupby, reference) -> pl.DataFrame:
         for g in groups
     ]
     return pl.concat(frames, how="vertical")
-
-
-def _resolve_threads(threads: int) -> int:
-    """pdex rejects threads<=0 / out-of-range; -1 -> all available CPUs (clamped)."""
-    if threads is not None and threads > 0:
-        return int(threads)
-    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    return max(1, n)
 
 
 def _de_pdex_pvalues(log_adata, *, groupby, reference, threads) -> pl.DataFrame:

@@ -25,6 +25,7 @@ them may import from ``metrics/``.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -134,8 +135,66 @@ def _loo_bulk(P, Y_block, r, bulk_target_sum, *, xp=np):
     return xp.where((r > 0)[:, None], V, 0.0) - b[None, :]
 
 
+def _resolve_threads(threads: int) -> int:
+    """Shared by every threads= parameter in this fork: threads<=0 (or None) -> all available
+    CPUs. Lives here (moments.py imports nothing from the package) so de_compute.py can import
+    it too without a cycle (de_compute -> prep -> moments already; the reverse would not be)."""
+    if threads is not None and threads > 0:
+        return int(threads)
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, n)
+
+
+def _loo_bulk_chunk_reduce(P, Xd, r, bulk_target_sum, s, e, chunk):
+    """Sequential ``_loo_bulk`` over ``[s, e)`` in ``chunk``-row blocks, reduced to (s1, s2).
+
+    Factored out of :func:`jackknife_correction` so it can be dispatched per-block across
+    threads (vcc2026 fork): each block is independent and ``_loo_bulk`` is pure numpy, which
+    releases the GIL for its C-level array ops, so this parallelizes for real rather than
+    serializing behind the interpreter lock.
+    """
+    G = Xd.shape[1]
+    s1 = np.zeros(G, dtype=np.float64)
+    s2 = np.zeros(G, dtype=np.float64)
+    for cs in range(s, e, chunk):
+        ce = min(cs + chunk, e)
+        V = _loo_bulk(P, Xd[cs:ce].toarray(), r[cs:ce], bulk_target_sum)
+        s1 += V.sum(axis=0)
+        s2 += np.einsum("ij,ij->j", V, V)   # no V*V temporary
+    return s1, s2
+
+
+def _loo_reduce(P, Xd, r, bulk_target_sum, chunk, n_jobs):
+    """(s1, s2) for one group, sequentially or split across ``n_jobs`` threads.
+
+    Splits the group's ROWS into ``n_jobs`` contiguous blocks (not individual chunks) so the
+    per-thread dispatch count stays small regardless of how fine ``chunk`` is -- chunking
+    within each block for cache locality and splitting the group across threads for
+    parallelism are the two DIFFERENT levers from the vcc2026 profiling pass, and they
+    compose rather than substitute for each other (confirmed directly: threaded at the
+    library's own default chunk=512 is faster than sequential, but still slower than
+    threaded at a smaller chunk -- see the fork's commit history). Below ``2 * chunk`` rows,
+    or at ``n_jobs<=1``, there's nothing to gain from splitting -- run it inline.
+    """
+    n = Xd.shape[0]
+    if n_jobs <= 1 or n < 2 * chunk:
+        return _loo_bulk_chunk_reduce(P, Xd, r, bulk_target_sum, 0, n, chunk)
+    from joblib import Parallel, delayed
+
+    n_blocks = min(n_jobs, max(1, n // chunk))
+    bounds = np.linspace(0, n, n_blocks + 1).astype(np.intp)
+    results = Parallel(n_jobs=n_blocks, prefer="threads")(
+        delayed(_loo_bulk_chunk_reduce)(P, Xd, r, bulk_target_sum, bounds[i], bounds[i + 1], chunk)
+        for i in range(n_blocks)
+    )
+    s1 = sum(res[0] for res in results)
+    s2 = sum(res[1] for res in results)
+    return s1, s2
+
+
 def jackknife_correction(X, group_codes, n_groups: int,
-                         bulk_target_sum: float, *, chunk: int = 512) -> np.ndarray:
+                         bulk_target_sum: float, *, chunk: int = 512,
+                         threads: int = 1) -> np.ndarray:
     """Delete-1 jackknife ``C_p`` for the ``bulk_lognorm`` comparator (issue #264 §3.6).
 
         r_i  = S_p - lib_i          S_p = Σ_g P_p,g,  lib_i = Σ_g y_ig
@@ -215,6 +274,7 @@ def jackknife_correction(X, group_codes, n_groups: int,
     out = np.zeros(n_groups, dtype=np.float64)
     order = np.argsort(codes, kind="stable")
     bounds = np.searchsorted(codes[order], np.arange(n_groups + 1))
+    n_jobs = _resolve_threads(threads)
     for p in range(n_groups):
         rows = order[bounds[p]:bounds[p + 1]]
         n = rows.size
@@ -227,14 +287,7 @@ def jackknife_correction(X, group_codes, n_groups: int,
         tot = float(P.sum())
         if tot <= 0.0:
             continue
-        G = Xd.shape[1]
-        s1 = np.zeros(G, dtype=np.float64)
-        s2 = np.zeros(G, dtype=np.float64)
-        for s in range(0, n, chunk):
-            V = _loo_bulk(P, Xd[s:s + chunk].toarray(), tot - lib[s:s + chunk],
-                          bulk_target_sum)
-            s1 += V.sum(axis=0)
-            s2 += np.einsum("ij,ij->j", V, V)   # no V*V temporary
+        s1, s2 = _loo_reduce(P, Xd, tot - lib, bulk_target_sum, chunk, n_jobs)
         out[p] = max(((n - 1) / n) * float((s2 - s1 ** 2 / n).sum()), 0.0)
     return out
 
