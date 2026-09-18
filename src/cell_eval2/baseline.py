@@ -14,10 +14,13 @@ emission as cells.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import sys
+import time
 import warnings
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -52,6 +55,21 @@ from .run import (
 )
 
 logger = logging.getLogger(__name__)
+
+# TEMPORARY diagnostic instrumentation (vcc2026 profiling pass) -- not for upstream, revert
+# before merging anything else. Opt-in via CELL_EVAL2_PHASE_TIMING=1 so normal runs are
+# unaffected.
+_PHASE_TIMING = bool(os.environ.get("CELL_EVAL2_PHASE_TIMING"))
+
+
+@contextlib.contextmanager
+def _phase(label: str):
+    if not _PHASE_TIMING:
+        yield
+        return
+    t0 = time.perf_counter()
+    yield
+    print(f"[phase] {label}: {time.perf_counter() - t0:.2f}s", file=sys.stderr, flush=True)
 
 
 def _version_lazy() -> str:
@@ -1387,7 +1405,8 @@ def build_generic_baseline(
     # Load a supplied DE table ONCE: the same frame goes to compute_metrics and to the
     # fingerprint, so the stamp cannot describe a different file than the one that scored.
     de_real = load_de_table(de_real) if de_real is not None else None
-    real_ad = _materialize_reference(real)
+    with _phase("materialize_reference"):
+        real_ad = _materialize_reference(real)
 
     # _profile_from_adata validates pert_col AND the control label from obs, so everything
     # after this point can assume both. Fingerprinting first would turn a mistyped pert_col
@@ -1396,11 +1415,12 @@ def build_generic_baseline(
     # (it is dropped there only when None), so before #253/#285 two baselines differing ONLY
     # in the map digested differently and came out numerically identical. Threading it makes
     # the digest describe the artifact again.
-    profile = _profile_from_adata(
-        real_ad, pert_col=config.pert_col, control=config.control,
-        exclude_target_gene=exclude_target_gene,
-        target_gene_map=config.target_gene_map,
-    )
+    with _phase("profile_from_adata"):
+        profile = _profile_from_adata(
+            real_ad, pert_col=config.pert_col, control=config.control,
+            exclude_target_gene=exclude_target_gene,
+            target_gene_map=config.target_gene_map,
+        )
     # Effective input type belongs to the REQUESTED config. Locking or baseline_config
     # first would let builder-specific changes influence a precondition on the reference.
     if (emit == "dispersed"
@@ -1415,10 +1435,11 @@ def build_generic_baseline(
             "baseline: emit='tile' is known-biased and exists only to reproduce pre-fix "
             "numbers; emit='dispersed' is the supported default."
         )
-    pred = _prediction_from_adata(
-        real_ad, profile, pert_col=config.pert_col, control=config.control,
-        emit=emit, seed=seed,
-    )
+    with _phase("prediction_from_adata (emission)"):
+        pred = _prediction_from_adata(
+            real_ad, profile, pert_col=config.pert_col, control=config.control,
+            emit=emit, seed=seed,
+        )
     effective = baseline_config(_lock_from_adata(real_ad, pred, config, de_real=de_real))
     # Same semantics as build_run_meta, or the two records would compare a metadata hash
     # against a content hash and mismatch by construction.
@@ -1428,7 +1449,8 @@ def build_generic_baseline(
     if emit == "dispersed":
         emission = pred.uns["baseline_emission"]
         try:
-            results = compute_metrics(pred, real_ad, config=effective, de_real=de_real)
+            with _phase("compute_metrics"):
+                results = compute_metrics(pred, real_ad, config=effective, de_real=de_real)
         except norm.ScaleLimitError as e:
             # The ordinary v2 scale gate runs inside compute_metrics. A rejected build
             # never gets a stamp, so carry the construction diagnostics in the exception;
@@ -1454,7 +1476,8 @@ def build_generic_baseline(
                 f"configured max_counts_per_cell={effective.max_counts_per_cell}."
             ) from e
     else:
-        results = compute_metrics(pred, real_ad, config=effective, de_real=de_real)
+        with _phase("compute_metrics"):
+            results = compute_metrics(pred, real_ad, config=effective, de_real=de_real)
     names = metric_output_names(effective)
     agg = aggregate_metrics_wide(results, metrics=names)
 
@@ -1470,7 +1493,8 @@ def build_generic_baseline(
     # (compute_metrics writes its own run_params.yaml when outdir is set; that is a record
     # of the attempt, not an artifact anyone scores.)
     if save_pred is not None:
-        pred.write_h5ad(save_pred)
+        with _phase("write_h5ad(save_pred)"):
+            pred.write_h5ad(save_pred)
 
     resolved = resolve_metrics(effective.metrics, version=effective.version)[0]
     effective_types = {

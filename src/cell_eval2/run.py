@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import math
 import os
+import sys
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import fields, replace
@@ -29,6 +32,22 @@ from .prep import (pseudobulk, pseudobulk_bulk_lognorm,
 from .streaming_bulk import inmem_pseudobulk
 
 logger = logging.getLogger(__name__)
+
+# TEMPORARY diagnostic instrumentation (vcc2026 profiling pass) -- not for upstream, revert
+# before merging anything else. Duplicated from baseline.py rather than imported: baseline.py
+# already imports FROM this module, so the reverse import would be circular.
+_PHASE_TIMING = bool(os.environ.get("CELL_EVAL2_PHASE_TIMING"))
+
+
+@contextlib.contextmanager
+def _phase(label: str):
+    if not _PHASE_TIMING:
+        yield
+        return
+    t0 = time.perf_counter()
+    yield
+    print(f"[phase] {label}: {time.perf_counter() - t0:.2f}s", file=sys.stderr, flush=True)
+
 
 _TIDY_SCHEMA = {"perturbation": pl.Utf8, "metric": pl.Utf8, "value": pl.Float64}
 
@@ -1710,29 +1729,32 @@ def _run_metrics(pred_ad, real_ad, *, cfg, de_pred, de_real, real_store, pred_st
     # _side_bulks returns {} and sets no stash, so the gate falls back to its own full pass.
     names_norms = _needed_normalizations(names, comparator=comparator)
     moment_norms = _moment_normalizations(names, comparator=comparator)
-    pred_side = _side_bulks(pred_ad, fp=pred_fp, store=pred_store, norms=names_norms, cfg=cfg,
-                            side="pred", moment_norms=moment_norms,
-                            effective_input_type=effective_types["pred"])
+    with _phase("pred pseudobulk (_side_bulks)"):
+        pred_side = _side_bulks(pred_ad, fp=pred_fp, store=pred_store, norms=names_norms, cfg=cfg,
+                                side="pred", moment_norms=moment_norms,
+                                effective_input_type=effective_types["pred"])
     pred_bulks, pred_moments = pred_side if moment_norms else (pred_side, None)
     if not getattr(pred_ad, "isbacked", False) and cfg.validate_input:
         _check_scale_limit_once(pred_ad, effective_types["pred"], cfg.max_counts_per_cell)
 
     prepared_de = None
     if any(CATALOG[n].kind == "de" for n in names):
-        de_real, de_pred = _materialize_de_sides(
-            pred_ad, real_ad, cfg=cfg, de_real=de_real, de_pred=de_pred,
-            real_fp=real_fp, real_store=real_store, pred_store=pred_store,
-        )
+        with _phase("DE sides materialize + compute (_materialize_de_sides)"):
+            de_real, de_pred = _materialize_de_sides(
+                pred_ad, real_ad, cfg=cfg, de_real=de_real, de_pred=de_pred,
+                real_fp=real_fp, real_store=real_store, pred_store=pred_store,
+            )
         # Written before _prepare_de_cached, which only consumes these tables -- and rebound
         # to the frames _write_de_tables loaded. Keeping the original arguments would leave
         # _prepare_de_cached re-reading a supplied PATH that these writes may have just
         # overwritten, scoring the run on the wrong table with correct files on disk.
         if write_de:
             de_real, de_pred = _write_de_tables(de_real, de_pred, cfg=cfg)
-        prepared_de = _prepare_de_cached(
-            de_pred, de_real, cfg=cfg, real_store=real_store, pred_store=pred_store,
-            de_real_supplied=de_real_supplied, de_pred_supplied=de_pred_supplied,
-        )
+        with _phase("DE prepare (_prepare_de_cached)"):
+            prepared_de = _prepare_de_cached(
+                de_pred, de_real, cfg=cfg, real_store=real_store, pred_store=pred_store,
+                de_real_supplied=de_real_supplied, de_pred_supplied=de_pred_supplied,
+            )
         ad_perts = set(map(str, pred_ad.obs[cfg.pert_col].unique())) - {cfg.control}
         de_perts = set(prepared_de.perturbations)
         if ad_perts != de_perts:
@@ -1769,18 +1791,21 @@ def _run_metrics(pred_ad, real_ad, *, cfg, de_pred, de_real, real_store, pred_st
     # reorder. Pass the already-open AnnData objects (backed for path inputs) so a miss materializes
     # via to_memory() on the open handle instead of re-reading the file (avoids a redundant
     # open + a TOCTOU window vs the earlier backed read used for metadata/fingerprint).
-    real_side = _side_bulks(real_ad, fp=real_fp, store=real_store, norms=norms, cfg=cfg,
-                            side="real", moment_norms=moment_norms,
-                            effective_input_type=effective_types["real"])
+    with _phase("real pseudobulk (_side_bulks)"):
+        real_side = _side_bulks(real_ad, fp=real_fp, store=real_store, norms=norms, cfg=cfg,
+                                side="real", moment_norms=moment_norms,
+                                effective_input_type=effective_types["real"])
     real_bulks, real_moments = real_side if moment_norms else (real_side, None)
 
     rows: list[dict] = []
-    rows.extend(dispatch_de_metrics(names, prepared_de, cfg))
-    rows.extend(dispatch_anndata_metrics(names, pred_bulks, real_bulks, genes, cfg,
-                                         comparator=comparator,
-                                         pred_moments=pred_moments,
-                                         real_moments=real_moments,
-                                         driver="compute_metrics (in-memory)"))
+    with _phase("dispatch_de_metrics"):
+        rows.extend(dispatch_de_metrics(names, prepared_de, cfg))
+    with _phase("dispatch_anndata_metrics"):
+        rows.extend(dispatch_anndata_metrics(names, pred_bulks, real_bulks, genes, cfg,
+                                             comparator=comparator,
+                                             pred_moments=pred_moments,
+                                             real_moments=real_moments,
+                                             driver="compute_metrics (in-memory)"))
 
     df = pl.DataFrame(rows, schema=_TIDY_SCHEMA) if rows else pl.DataFrame(schema=_TIDY_SCHEMA)
     if pred_store is not None and result_fp is not None:
