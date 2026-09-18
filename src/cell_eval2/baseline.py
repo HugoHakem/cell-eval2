@@ -324,6 +324,14 @@ def _emit_scaled_resample(
     draws = [rng.integers(0, control_X.shape[0], size=size) for size in sizes]
     source = (np.concatenate(draws).astype(np.intp, copy=False) if draws
               else np.empty(0, dtype=np.intp))
+    # control_X[source] resamples with replacement, so its nnz can exceed what control_X's own
+    # (usually int32) indices/indptr can address -- scipy's dtype picker only looks at
+    # control_X's existing dtype, not the draw size, so it won't catch this itself. Widen only
+    # if the draw would actually overflow int32.
+    row_nnz = control_X.indptr[source + 1].astype(np.int64) - control_X.indptr[source].astype(np.int64)
+    if row_nnz.sum() > np.iinfo(np.int32).max:
+        control_X.indices = control_X.indices.astype(np.int64, copy=False)
+        control_X.indptr = control_X.indptr.astype(np.int64, copy=False)
     out = control_X[source].copy()
     # scale stays float64. Casting it to float32 first and multiplying in place was suggested
     # (Gemini, PR #241) to halve the gathered temporary; REJECTED on measurement. A float64
