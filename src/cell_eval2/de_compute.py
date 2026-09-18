@@ -28,7 +28,18 @@ def _notice_scanpy_ignores_threads() -> None:
 
 # deseq2 is opt-in and NEVER auto-selected (see _resolve_backend's auto tuple). Its CPU numpy
 # backend runs without a GPU, so _available needs only the module (no GPU branch like gpudge).
-_BACKEND_MODULE = {"gpudge": "gpudge", "pdex": "pdex", "scanpy": "scanpy", "deseq2": "deseq2_gpu"}
+#
+# "illico" (github.com/remydubois/illico) is a vcc2026-fork addition, NOT upstream cell_eval2.
+# Also CPU-only, also opt-in / never auto-selected -- unlike deseq2 that's not because it needs
+# different inputs, but because our own validation is still thin (one panel, one OVO-vs-
+# reference config; see the vcc2026 conversation that added this). Benchmarked directly against
+# pdex on that one panel: ~10x faster on the DE step alone, and bit-exact identical scored
+# metrics (max abs diff 0.0 across all 445 (perturbation, metric) values). Use
+# backend="illico" explicitly once you want it; it will not be picked by "auto".
+_BACKEND_MODULE = {
+    "gpudge": "gpudge", "pdex": "pdex", "scanpy": "scanpy", "deseq2": "deseq2_gpu",
+    "illico": "illico",
+}
 
 
 def _available(backend: str) -> bool:
@@ -807,15 +818,22 @@ def compute_de(
     # Log-space input for the MWU engine; the engine may mutate it in place (no second
     # copy inside the engine). counts -> log1p of the single CPM (a fresh, disposable
     # buffer). lognorm -> the original log-space input: scanpy writes uns so it needs a
-    # private copy, but pdex does not mutate (verified PR #8) so it reads adata directly.
+    # private copy, and pdex does not mutate (verified PR #8) so it reads adata directly.
+    # illico DOES mutate in place (checked directly: illico/utils/ranking.py's
+    # _sort_csc_columns_inplace / _sort_along_axis_inplace, called on the input matrix from
+    # both the dense and sparse OVO paths) -- so it gets the same private-copy treatment as
+    # scanpy, not pdex's.
     if is_counts:
         log_adata = _log1p_view(linear)
     else:
-        log_adata = adata.copy() if resolved == "scanpy" else adata
+        log_adata = adata.copy() if resolved in ("scanpy", "illico") else adata
     if resolved == "scanpy":
         if threads is not None and threads > 1:
             _notice_scanpy_ignores_threads()  # scanpy ignores num_threads (finding #40)
         pvals = _de_scanpy_pvalues(log_adata, groupby=groupby, reference=reference)
+    elif resolved == "illico":
+        pvals = _de_illico_pvalues(log_adata, groupby=groupby, reference=reference,
+                                   threads=threads)
     else:  # pdex
         pvals = _de_pdex_pvalues(log_adata, groupby=groupby, reference=reference,
                                  threads=threads)
@@ -908,6 +926,38 @@ def _de_pdex_pvalues(log_adata, *, groupby, reference, threads) -> pl.DataFrame:
         pl.col("p_value"),
         pl.col("fdr").alias("p_adj"),
     ])
+
+
+def _de_illico_pvalues(log_adata, *, groupby, reference, threads) -> pl.DataFrame:
+    """MWU p-values from illico on PRE-LOG-NORMALIZED input (is_log1p=True); illico's own
+    fold_change is discarded -- cell_eval2 computes the LFC, same as the pdex path.
+
+    illico's non-scanpy return (``return_as_scanpy=False``) has no FDR column -- only the
+    scanpy-formatting path applies ``corr_method`` internally (checked directly in
+    ``asymptotic_wilcoxon``'s source: the correction call lives inside
+    ``format_illico_results_for_scanpy``, which this path skips). So BH is applied here
+    instead, per perturbation group -- matching how this module's own DE test is scoped
+    (each perturbation's family of gene tests corrected on its own, not once across the
+    panel; see docs/vcc2026_metrics's "Multiple testing and significance").
+
+    Caller must pass a disposable ``log_adata``: illico sorts CSC columns / rows in place
+    (verified directly -- ``illico.utils.ranking._sort_csc_columns_inplace`` /
+    ``_sort_along_axis_inplace``, called from both the dense and sparse OVO paths), unlike
+    pdex which is verified not to mutate its input.
+    """
+    import illico
+
+    df = illico.asymptotic_wilcoxon(
+        log_adata, is_log1p=True, group_keys=groupby, reference=reference,
+        n_threads=_resolve_threads(threads), return_as_scanpy=False,
+    ).reset_index()
+
+    p_adj = np.empty(len(df), dtype=float)
+    for _, idx in df.groupby("pert").indices.items():
+        p_adj[idx] = false_discovery_control(df["p_value"].to_numpy()[idx], method="bh")
+    df["p_adj"] = p_adj
+
+    return pl.from_pandas(df.rename(columns={"pert": "target"})[["target", "feature", "p_value", "p_adj"]])
 
 
 def compute_de_streaming(

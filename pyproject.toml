@@ -82,6 +82,12 @@ gpu = ["cupy-cuda12x", "nvidia-nvcomp-cu12"]
 # a pure-Python `py3-none-any` wheel with `Requires-Python: >=3.11`.
 gpudge = ["gpudge>=0.9.0"]
 
+# vcc2026-fork addition, not upstream: the "illico" DE backend (de_compute._de_illico_pvalues).
+# pdex/scanpy are soft, undeclared dependencies (checked via importlib.util.find_spec, no extra
+# gates them) -- illico gets a real extra here mainly so `pip install 'cell-eval2[illico]'` is
+# self-documenting for anyone reading this fork's diff against upstream.
+illico = ["illico"]
+
 [project.scripts]
 cell-eval2 = "cell_eval2.cli:main"
 

@@ -22,7 +22,10 @@ _TIE_POLICIES = ("midrank", "position")
 _EXCLUSION_SCOPES = ("row", "panel")
 _DE_SORT_KEYS = ("abs_log2_fold_change", "log2_fold_change", "p_value", "p_adj")
 _DE_METHODS = ("wilcoxon", "deseq2")
-_DE_BACKENDS = ("auto", "gpudge", "pdex", "scanpy", "deseq2")
+# "illico" is a vcc2026-fork addition (not upstream cell_eval2), see de_compute.py's
+# _BACKEND_MODULE comment: NOT in the "auto" resolution chain, opt-in only via an explicit
+# backend="illico".
+_DE_BACKENDS = ("auto", "gpudge", "pdex", "scanpy", "deseq2", "illico")
 _MEAN_CALCS = ("arithmetic", "geometric")
 _NAN_LFC_POLICIES = ("keep", "mask")
 _FDR_SCOPES = ("global", "per_pert")
@@ -101,7 +104,7 @@ class DEParams:
     ] = "abs_log2_fold_change"
     method: Literal["wilcoxon", "deseq2"] = "wilcoxon"  # provenance (DE test that produced the table)
     nan_lfc_policy: Literal["keep", "mask"] = "mask"  # v1=keep (cell-eval), v2=mask (force p_adj=1)
-    backend: Literal["auto", "gpudge", "pdex", "scanpy", "deseq2"] = "auto"  # availability choice; NOT version-scoped
+    backend: Literal["auto", "gpudge", "pdex", "scanpy", "deseq2", "illico"] = "auto"  # availability choice; NOT version-scoped
     replicate_col: str | None = None  # obs column defining pseudobulk replicates (deseq2 backend only)
     mean_calc: Literal["arithmetic", "geometric"] = "arithmetic"    # version-scoped (= v2)
     epsilon: float = 1e-9                                           # version-scoped (= v2)
